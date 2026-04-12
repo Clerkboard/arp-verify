@@ -1,11 +1,11 @@
 {
-  "name": "acp-verify",
+  "name": "arp-verify",
   "version": "0.1.0",
-  "description": "Verify ACP endpoint compliance",
+  "description": "Verify ARP endpoint compliance",
   "license": "MIT",
   "type": "module",
   "bin": {
-    "acp-verify": "dist/index.js"
+    "arp-verify": "dist/index.js"
   },
   "scripts": {
     "build": "tsc",

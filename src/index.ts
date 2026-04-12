@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 /**
- * ACP Endpoint Verification CLI
+ * ARP Endpoint Verification CLI
  *
- * Runs a sequence of checks against a live ACP endpoint and reports
+ * Runs a sequence of checks against a live ARP endpoint and reports
  * pass/fail for each one. Exits 0 if all pass, 1 if any fail.
  *
  * Usage:
- *   npx acp-verify agents.mycompany.com
- *   npx acp-verify agents.mycompany.com --agent order-processor
- *   npx acp-verify localhost:3141
+ *   npx arp-verify agents.mycompany.com
+ *   npx arp-verify agents.mycompany.com --agent order-processor
+ *   npx arp-verify localhost:3141
  */
 
 import crypto from 'node:crypto';
@@ -21,7 +21,7 @@ const canonicalize = _canonicalize as unknown as (obj: unknown) => string | unde
 // ---------------------------------------------------------------------------
 
 interface AgentCard {
-  acp: string;
+  arp: string;
   name: string;
   did: string;
   inbox: string;
@@ -73,8 +73,8 @@ interface DIDDocument {
   }>;
 }
 
-interface ACPMessage {
-  acp: string;
+interface ARPMessage {
+  arp: string;
   id: string;
   type: string;
   from: string;
@@ -91,10 +91,11 @@ interface CheckResult {
   name: string;
   passed: boolean;
   message: string;
+  warning?: boolean;
 }
 
 // ---------------------------------------------------------------------------
-// Crypto helpers (same approach as acp-server-ts)
+// Crypto helpers (same approach as arp-server-ts)
 // ---------------------------------------------------------------------------
 
 const ED25519_SPKI_HEADER = Buffer.from('302a300506032b6570032100', 'hex');
@@ -136,7 +137,7 @@ function generateKeyPair(): { privateKey: crypto.KeyObject; publicKeyMultibase: 
   return { privateKey, publicKeyMultibase: pubMultibase, did };
 }
 
-function signMessage(message: ACPMessage, privateKey: crypto.KeyObject): ACPMessage {
+function signMessage(message: ARPMessage, privateKey: crypto.KeyObject): ARPMessage {
   const { signature: _sig, ...rest } = message;
   const canonical = canonicalize(rest);
   if (canonical === undefined) {
@@ -148,7 +149,7 @@ function signMessage(message: ACPMessage, privateKey: crypto.KeyObject): ACPMess
   return message;
 }
 
-function verifyMessageSignature(message: ACPMessage, publicKey: crypto.KeyObject): boolean {
+function verifyMessageSignature(message: ARPMessage, publicKey: crypto.KeyObject): boolean {
   if (!message.signature) return false;
   const sigBytes = decodeMultibase(message.signature);
   const { signature: _sig, ...rest } = message;
@@ -174,15 +175,15 @@ function parseArgs(): { domain: string; agentName?: string } {
   const args = process.argv.slice(2);
   if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
     console.log(`
-ACP Endpoint Verification CLI
+ARP Endpoint Verification CLI
 
 Usage:
-  acp-verify <domain[:port]> [--agent <name>]
+  arp-verify <domain[:port]> [--agent <name>]
 
 Examples:
-  acp-verify agents.mycompany.com
-  acp-verify agents.mycompany.com --agent order-processor
-  acp-verify localhost:3141
+  arp-verify agents.mycompany.com
+  arp-verify agents.mycompany.com --agent order-processor
+  arp-verify localhost:3141
 
 Options:
   --agent <name>   Test a specific agent (default: first from index)
@@ -252,6 +253,10 @@ function fail(name: string, message: string) {
   results.push({ name, passed: false, message });
 }
 
+function warn(name: string, message: string) {
+  results.push({ name, passed: true, message, warning: true });
+}
+
 // ---------------------------------------------------------------------------
 // Main verification flow
 // ---------------------------------------------------------------------------
@@ -261,7 +266,7 @@ async function run() {
   const base = baseUrl(domain);
 
   console.log('');
-  console.log('ACP Endpoint Verification');
+  console.log('ARP Endpoint Verification');
   console.log(`Target: ${domain}`);
   console.log('');
 
@@ -278,11 +283,17 @@ async function run() {
     const res = await fetchJSON(url);
     const text = typeof res.body === 'string' ? res.body : JSON.stringify(res.body);
     if (!res.ok) {
-      fail('agents.txt', `HTTP ${res.status} from ${url}. Ensure your server exposes GET /agents.txt returning a text file with an "acp-index:" line.`);
-    } else if (!text.includes('acp-index:')) {
-      fail('agents.txt', `File found but missing "acp-index:" directive. The agents.txt file must contain a line like: acp-index: ${base}/.well-known/acp/index.json`);
+      fail('agents.txt', `HTTP ${res.status} from ${url}. Ensure your server exposes GET /agents.txt returning a text file with an "arp-index:" line.`);
+    } else if (!text.includes('arp-index:')) {
+      fail('agents.txt', `File found but missing "arp-index:" directive. The agents.txt file must contain a line like: arp-index: ${base}/.well-known/arp/index.json`);
     } else {
       pass('agents.txt', 'agents.txt found');
+      if (!text.includes('arp-version:')) {
+        warn('agents.txt', 'Missing "arp-version:" field. Recommended: arp-version: 1.0');
+      }
+      if (!text.includes('arp-docs:')) {
+        warn('agents.txt', 'Missing "arp-docs:" field. Recommended: link to protocol documentation for AI agent discovery.');
+      }
     }
   } catch (err) {
     fail('agents.txt', `Could not reach ${base}/agents.txt — ${(err as Error).message}. Is the server running at ${domain}?`);
@@ -290,10 +301,10 @@ async function run() {
 
   // 2. Agent Index
   try {
-    const url = `${base}/.well-known/acp/index.json`;
+    const url = `${base}/.well-known/arp/index.json`;
     const res = await fetchJSON(url);
     if (!res.ok) {
-      fail('Agent Index', `HTTP ${res.status} from ${url}. Ensure your server exposes GET /.well-known/acp/index.json returning the agent index.`);
+      fail('Agent Index', `HTTP ${res.status} from ${url}. Ensure your server exposes GET /.well-known/arp/index.json returning the agent index.`);
     } else {
       const data = res.body as Record<string, unknown>;
       const missing: string[] = [];
@@ -309,7 +320,7 @@ async function run() {
       }
     }
   } catch (err) {
-    fail('Agent Index', `Could not fetch agent index — ${(err as Error).message}. Ensure /.well-known/acp/index.json is served.`);
+    fail('Agent Index', `Could not fetch agent index — ${(err as Error).message}. Ensure /.well-known/arp/index.json is served.`);
   }
 
   // Determine which agent to test
@@ -327,16 +338,16 @@ async function run() {
 
   // 3. Agent Card
   try {
-    const url = `${base}/.well-known/acp/${agentName}.json`;
+    const url = `${base}/.well-known/arp/${agentName}.json`;
     const res = await fetchJSON(url);
     if (!res.ok) {
-      fail('Agent Card', `HTTP ${res.status} from ${url}. Ensure your server exposes the agent card at /.well-known/acp/${agentName}.json`);
+      fail('Agent Card', `HTTP ${res.status} from ${url}. Ensure your server exposes the agent card at /.well-known/arp/${agentName}.json`);
     } else {
       const data = res.body as Record<string, unknown>;
-      const required = ['acp', 'name', 'did', 'inbox', 'publicKey', 'description', 'capabilities', 'auth'];
+      const required = ['arp', 'name', 'did', 'inbox', 'publicKey', 'description', 'capabilities', 'auth'];
       const missing = required.filter(f => data[f] === undefined || data[f] === null);
       if (missing.length > 0) {
-        fail('Agent Card', `Agent card missing required fields: ${missing.join(', ')}. See the ACP spec for the full AgentCard schema.`);
+        fail('Agent Card', `Agent card missing required fields: ${missing.join(', ')}. See the ARP spec for the full AgentCard schema.`);
       } else {
         agentCard = data as unknown as AgentCard;
         pass('Agent Card', `Agent Card valid: ${agentName}`);
@@ -400,7 +411,7 @@ async function run() {
   const inboxUrl = agentCard?.inbox ?? `${base}/${agentName}/inbox`;
   try {
     const unsignedMsg = {
-      acp: '1.0',
+      arp: '1.0',
       id: newMessageId(),
       type: 'request',
       from: 'did:key:test-unsigned',
@@ -410,7 +421,7 @@ async function run() {
     };
     const res = await fetchJSON(inboxUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/acp+json' },
+      headers: { 'Content-Type': 'application/arp+json' },
       body: JSON.stringify(unsignedMsg),
     });
     if (res.status === 404) {
@@ -424,7 +435,7 @@ async function run() {
       } else if (typeof body === 'object' && body !== null) {
         pass('Inbox Reachable', 'Inbox reachable (returns structured errors)');
       } else {
-        fail('Inbox Reachable', `Inbox returned HTTP ${res.status} but the response is not a structured ACP error. The inbox should return ACP error messages (with body.code) for invalid requests.`);
+        fail('Inbox Reachable', `Inbox returned HTTP ${res.status} but the response is not a structured ARP error. The inbox should return ARP error messages (with body.code) for invalid requests.`);
       }
     }
   } catch (err) {
@@ -437,8 +448,8 @@ async function run() {
 
   let negotiateOk = false;
   try {
-    const negotiateMsg: ACPMessage = {
-      acp: '1.0',
+    const negotiateMsg: ARPMessage = {
+      arp: '1.0',
       id: newMessageId(),
       type: 'negotiate',
       from: clientKeys.did,
@@ -453,12 +464,12 @@ async function run() {
 
     const res = await fetchJSON(inboxUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/acp+json' },
+      headers: { 'Content-Type': 'application/arp+json' },
       body: JSON.stringify(negotiateMsg),
     });
 
     if (res.status === 200) {
-      const body = res.body as ACPMessage;
+      const body = res.body as ARPMessage;
       if (body.type === 'acknowledge') {
         negotiateOk = true;
         pass('First-Contact Negotiate', 'First-contact negotiate accepted');
@@ -477,7 +488,7 @@ async function run() {
 
   // 8. Echo Test
   const hasEcho = agentCard?.capabilities?.some(c => c.name === 'echo') ?? false;
-  let echoResponse: ACPMessage | undefined;
+  let echoResponse: ARPMessage | undefined;
 
   if (!hasEcho) {
     pass('Echo Test', 'Echo capability not listed — skipped');
@@ -485,8 +496,8 @@ async function run() {
     fail('Echo Test', 'Skipped — negotiate failed. Fix the negotiate check first.');
   } else {
     try {
-      const echoMsg: ACPMessage = {
-        acp: '1.0',
+      const echoMsg: ARPMessage = {
+        arp: '1.0',
         id: newMessageId(),
         type: 'request',
         from: clientKeys.did,
@@ -499,12 +510,12 @@ async function run() {
 
       const res = await fetchJSON(inboxUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/acp+json' },
+        headers: { 'Content-Type': 'application/arp+json' },
         body: JSON.stringify(echoMsg),
       });
 
       if (res.status === 200) {
-        const body = res.body as ACPMessage;
+        const body = res.body as ARPMessage;
         if (body.type === 'response') {
           echoResponse = body;
           pass('Echo Test', 'Echo capability works');
@@ -526,14 +537,14 @@ async function run() {
     fail('Server Signatures', 'Cannot verify — no successful response to check. Fix previous failures first.');
   } else {
     // Try to verify the echo response first, fall back to getting a fresh negotiate response
-    let responseToCheck: ACPMessage | undefined = echoResponse;
+    let responseToCheck: ARPMessage | undefined = echoResponse;
 
     if (!responseToCheck) {
       // Use a fresh negotiate to get a signed response
       try {
         const checkKeys = generateKeyPair();
-        const msg: ACPMessage = {
-          acp: '1.0',
+        const msg: ARPMessage = {
+          arp: '1.0',
           id: newMessageId(),
           type: 'negotiate',
           from: checkKeys.did,
@@ -548,11 +559,11 @@ async function run() {
 
         const res = await fetchJSON(inboxUrl, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/acp+json' },
+          headers: { 'Content-Type': 'application/arp+json' },
           body: JSON.stringify(msg),
         });
         if (res.status === 200) {
-          responseToCheck = res.body as ACPMessage;
+          responseToCheck = res.body as ARPMessage;
         }
       } catch {
         // fall through
@@ -562,7 +573,7 @@ async function run() {
     if (!responseToCheck) {
       fail('Server Signatures', 'No response available to verify. This may indicate a server issue.');
     } else if (!responseToCheck.signature) {
-      fail('Server Signatures', 'Server response is missing a "signature" field. All ACP responses must be signed by the server.');
+      fail('Server Signatures', 'Server response is missing a "signature" field. All ARP responses must be signed by the server.');
     } else {
       const valid = verifyMessageSignature(responseToCheck, serverPublicKey);
       if (valid) {
@@ -576,8 +587,8 @@ async function run() {
   // 10. First-Contact Enforcement
   try {
     const newKeys = generateKeyPair();
-    const reqMsg: ACPMessage = {
-      acp: '1.0',
+    const reqMsg: ARPMessage = {
+      arp: '1.0',
       id: newMessageId(),
       type: 'request',
       from: newKeys.did,
@@ -590,12 +601,12 @@ async function run() {
 
     const res = await fetchJSON(inboxUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/acp+json' },
+      headers: { 'Content-Type': 'application/arp+json' },
       body: JSON.stringify(reqMsg),
     });
 
     if (res.status === 403) {
-      const body = res.body as ACPMessage;
+      const body = res.body as ARPMessage;
       const innerBody = body?.body as Record<string, unknown> | undefined;
       if (innerBody?.code === 'FIRST_CONTACT_REQUIRED') {
         pass('First-Contact Enforcement', 'First-contact enforcement working');
@@ -615,8 +626,8 @@ async function run() {
   } else {
     try {
       const pastDate = new Date(Date.now() - 60_000).toISOString(); // 1 minute ago
-      const expiredMsg: ACPMessage = {
-        acp: '1.0',
+      const expiredMsg: ARPMessage = {
+        arp: '1.0',
         id: newMessageId(),
         type: 'request',
         from: clientKeys.did,
@@ -630,12 +641,12 @@ async function run() {
 
       const res = await fetchJSON(inboxUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/acp+json' },
+        headers: { 'Content-Type': 'application/arp+json' },
         body: JSON.stringify(expiredMsg),
       });
 
       if (res.status === 400) {
-        const body = res.body as ACPMessage;
+        const body = res.body as ARPMessage;
         const innerBody = body?.body as Record<string, unknown> | undefined;
         if (innerBody?.code === 'MESSAGE_EXPIRED') {
           pass('Expired Message Rejection', 'Expired message rejected');
@@ -683,13 +694,13 @@ function printResults() {
   const total = results.length;
 
   for (const r of results) {
-    const icon = r.passed ? '\x1b[32m\u2713\x1b[0m' : '\x1b[31m\u2717\x1b[0m';
+    const icon = r.warning ? '\x1b[33m\u26a0\x1b[0m' : r.passed ? '\x1b[32m\u2713\x1b[0m' : '\x1b[31m\u2717\x1b[0m';
     console.log(`  ${icon} ${r.message}`);
   }
 
   console.log('');
   if (passed === total) {
-    console.log(`  \x1b[32m${passed}/${total} checks passed \u2014 endpoint is ACP compliant\x1b[0m`);
+    console.log(`  \x1b[32m${passed}/${total} checks passed \u2014 endpoint is ARP compliant\x1b[0m`);
   } else {
     const failed = total - passed;
     console.log(`  \x1b[31m${passed}/${total} checks passed, ${failed} failed\x1b[0m`);

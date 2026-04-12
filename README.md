@@ -1,20 +1,20 @@
-# acp-verify
+# arp-verify
 
-Verify ACP (Agent Communication Protocol) endpoint compliance.
+Verify ARP (Agent Relations Protocol) endpoint compliance.
 
 ## Usage
 
 ```bash
-npx acp-verify agents.mycompany.com
-npx acp-verify agents.mycompany.com --agent order-processor
-npx acp-verify localhost:3141
+npx arp-verify agents.mycompany.com
+npx arp-verify agents.mycompany.com --agent order-processor
+npx arp-verify localhost:3141
 ```
 
 ## Checks
 
-1. **agents.txt** -- Fetch `/agents.txt`, verify it contains an `acp-index:` line
-2. **Agent Index** -- Fetch `/.well-known/acp/index.json`, verify structure
-3. **Agent Card** -- Fetch `/.well-known/acp/{agent}.json`, verify required fields
+1. **agents.txt** -- Fetch `/agents.txt`, verify it contains an `arp-index:` line
+2. **Agent Index** -- Fetch `/.well-known/arp/index.json`, verify structure
+3. **Agent Card** -- Fetch `/.well-known/arp/{agent}.json`, verify required fields
 4. **DID Document** -- Fetch `/{agent}/did.json`, verify structure
 5. **Key Consistency** -- Check Agent Card `publicKey` matches DID doc `publicKeyMultibase`
 6. **Inbox Reachable** -- POST unsigned message, verify structured error response
