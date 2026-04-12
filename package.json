@@ -2,6 +2,7 @@
   "name": "acp-verify",
   "version": "0.1.0",
   "description": "Verify ACP endpoint compliance",
+  "license": "MIT",
   "type": "module",
   "bin": {
     "acp-verify": "dist/index.js"
