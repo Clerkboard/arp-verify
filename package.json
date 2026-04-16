@@ -1,6 +1,6 @@
 {
   "name": "@agentrelationsprotocol/arp-verify",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "CLI to verify Agent Relations Protocol (ARP) endpoint compliance. Fetches DID documents, agent cards, the discovery index, and tests signed messaging, first-contact enforcement, and signature validation.",
   "keywords": [
     "arp",

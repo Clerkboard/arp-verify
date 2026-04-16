@@ -429,15 +429,24 @@ async function run() {
     return;
   }
 
+  // The canonical ARP address form is handle@domain (spec §4.1). Local paths
+  // and legacy DID fallbacks use the bare handle only.
+  const agentHandle = agentName.split('@')[0];
+
   // 3. Agent Card
   // Prefer the URL advertised in the directory manifest (supports subdomain-per-agent layouts);
-  // fall back to the conventional /.well-known/arp/<name>.json under the base domain.
-  const indexEntry = agentIndex?.agents.find(a => a.name === agentName);
-  const cardUrl = indexEntry?.url ?? `${base}/.well-known/arp/${agentName}.json`;
+  // fall back to the conventional /.well-known/arp/<handle>.json under the base domain.
+  // Match both bare handles and the canonical handle@domain form.
+  const indexEntry = agentIndex?.agents.find(a => {
+    if (a.name === agentName) return true;
+    const aHandle = a.name.split('@')[0];
+    return aHandle === agentHandle;
+  });
+  const cardUrl = indexEntry?.url ?? `${base}/.well-known/arp/${agentHandle}.json`;
   try {
     const res = await fetchJSON(cardUrl);
     if (!res.ok) {
-      fail('Agent Card', `HTTP ${res.status} from ${cardUrl}. Ensure the card URL advertised in the directory index (or /.well-known/arp/${agentName}.json under ${base}) returns a valid Agent Card.`);
+      fail('Agent Card', `HTTP ${res.status} from ${cardUrl}. Ensure the card URL advertised in the directory index (or /.well-known/arp/${agentHandle}.json under ${base}) returns a valid Agent Card.`);
     } else {
       const data = res.body as Record<string, unknown>;
       const required = ['arp', 'name', 'did', 'inbox', 'publicKey', 'description', 'capabilities', 'auth'];
@@ -469,7 +478,7 @@ async function run() {
     }
   } else {
     // No card fetched — try a legacy single-host fallback so we at least produce a clear error.
-    didUrl = `${base}/${agentName}/did.json`;
+    didUrl = `${base}/${agentHandle}/did.json`;
   }
   try {
     if (!didUrl) {
@@ -527,14 +536,14 @@ async function run() {
   }
 
   // 6. Inbox Reachable (unsigned POST)
-  const inboxUrl = agentCard?.inbox ?? `${base}/${agentName}/inbox`;
+  const inboxUrl = agentCard?.inbox ?? `${base}/${agentHandle}/inbox`;
   try {
     const unsignedMsg = {
       arp: '1.0',
       id: newMessageId(),
       type: 'request',
       from: 'did:web:arp-verify.invalid:unsigned-test',
-      to: agentCard?.did ?? `did:web:${domain}:${agentName}`,
+      to: agentCard?.did ?? `did:web:${domain}:${agentHandle}`,
       createdAt: nowISO(),
       body: { test: true },
     };
@@ -563,7 +572,7 @@ async function run() {
 
   // 7. Signature Verification / Negotiate (first-contact)
   const clientKeys = verifier;
-  const agentDid = agentCard?.did ?? `did:web:${domain}:${agentName}`;
+  const agentDid = agentCard?.did ?? `did:web:${domain}:${agentHandle}`;
 
   let negotiateOk = false;
   try {
@@ -587,19 +596,22 @@ async function run() {
       body: JSON.stringify(negotiateMsg),
     });
 
-    if (res.status === 200) {
+    // Accept any 2xx — async servers use 202 "Accepted" for queued delivery,
+    // sync servers use 200 OK. Both are valid per the spec as long as the body
+    // is a well-formed `acknowledge` message.
+    if (res.status >= 200 && res.status < 300) {
       const body = res.body as ARPMessage;
       if (body.type === 'acknowledge') {
         negotiateOk = true;
-        pass('First-Contact Negotiate', 'First-contact negotiate accepted');
+        pass('First-Contact Negotiate', `First-contact negotiate accepted (HTTP ${res.status})`);
       } else {
-        fail('First-Contact Negotiate', `Server returned 200 but type="${body.type}" instead of "acknowledge". The negotiate response should be type "acknowledge".`);
+        fail('First-Contact Negotiate', `Server returned HTTP ${res.status} but type="${body.type}" instead of "acknowledge". The negotiate response should be type "acknowledge".`);
       }
     } else {
       const body = res.body as Record<string, unknown>;
       const innerBody = body?.body as Record<string, unknown> | undefined;
       const errMsg = innerBody?.message ?? JSON.stringify(body);
-      fail('First-Contact Negotiate', `Server returned HTTP ${res.status}: ${errMsg}. A signed negotiate message with firstContact=true should be accepted with 200.`);
+      fail('First-Contact Negotiate', `Server returned HTTP ${res.status}: ${errMsg}. A signed negotiate message with firstContact=true should be accepted with a 2xx status and an "acknowledge" body.`);
     }
   } catch (err) {
     fail('First-Contact Negotiate', `Negotiate request failed — ${(err as Error).message}`);
@@ -633,16 +645,19 @@ async function run() {
         body: JSON.stringify(echoMsg),
       });
 
-      if (res.status === 200) {
+      if (res.status >= 200 && res.status < 300) {
         const body = res.body as ARPMessage;
         if (body.type === 'response') {
           echoResponse = body;
-          pass('Echo Test', 'Echo capability works');
+          pass('Echo Test', `Echo capability works (HTTP ${res.status})`);
+        } else if (body.type === 'acknowledge') {
+          // Async-mode server: acknowledged receipt, actual response delivered out-of-band.
+          pass('Echo Test', `Echo request accepted for async delivery (HTTP ${res.status}, acknowledge)`);
         } else {
-          fail('Echo Test', `Server returned 200 but type="${body.type}" instead of "response". Echo requests should return type "response".`);
+          fail('Echo Test', `Server returned HTTP ${res.status} but type="${body.type}" instead of "response"/"acknowledge". Echo requests should return either a synchronous "response" or an async "acknowledge".`);
         }
       } else {
-        fail('Echo Test', `Echo request returned HTTP ${res.status}. A signed request with capability "echo" should return 200 with the echoed body.`);
+        fail('Echo Test', `Echo request returned HTTP ${res.status}. A signed request with capability "echo" should be accepted with a 2xx and an echoed response body.`);
       }
     } catch (err) {
       fail('Echo Test', `Echo request failed — ${(err as Error).message}`);
@@ -681,7 +696,7 @@ async function run() {
           headers: { 'Content-Type': 'application/arp+json' },
           body: JSON.stringify(msg),
         });
-        if (res.status === 200) {
+        if (res.status >= 200 && res.status < 300) {
           responseToCheck = res.body as ARPMessage;
         }
       } catch {
@@ -729,12 +744,14 @@ async function run() {
         body: JSON.stringify(openMsg),
       });
 
-      if (res.status === 200) {
+      if (res.status >= 200 && res.status < 300) {
         const body = res.body as ARPMessage;
         if (body.type === 'response') {
           pass('Open Capability', `Open capability "${openCap.name}" accepts requests without negotiate`);
+        } else if (body.type === 'acknowledge') {
+          pass('Open Capability', `Open capability "${openCap.name}" accepted for async delivery (HTTP ${res.status}, acknowledge)`);
         } else {
-          fail('Open Capability', `Server returned 200 but type="${body.type}" instead of "response".`);
+          fail('Open Capability', `Server returned HTTP ${res.status} but type="${body.type}" instead of "response"/"acknowledge".`);
         }
       } else {
         fail('Open Capability', `Server returned HTTP ${res.status} for open capability request without negotiate. Open capabilities should accept authenticated requests without prior handshake.`);
@@ -776,6 +793,11 @@ async function run() {
         } else {
           pass('First-Contact Enforcement', `First-contact enforcement working (403, code: ${innerBody?.code ?? 'unknown'})`);
         }
+      } else if (res.status >= 200 && res.status < 300 && negotiateOk) {
+        // The verifier just completed a negotiate — it's now a known sender. The first-contact
+        // enforcement test can't be validated synchronously on an endpoint that already has a
+        // relation with the bundled test identity. See README caveat.
+        warn('First-Contact Enforcement', `Not testable — the test identity has an established relation (prior negotiate succeeded). Reset the relation on the endpoint to run this check.`);
       } else {
         fail('First-Contact Enforcement', `Server returned HTTP ${res.status} instead of 403 for non-open capability from unknown sender.`);
       }
@@ -806,6 +828,8 @@ async function run() {
 
       if (res.status === 403) {
         pass('First-Contact Enforcement', 'First-contact enforcement working');
+      } else if (res.status >= 200 && res.status < 300 && negotiateOk) {
+        warn('First-Contact Enforcement', `Not testable — the test identity has an established relation (prior negotiate succeeded). Reset the relation on the endpoint to run this check.`);
       } else {
         fail('First-Contact Enforcement', `Server returned HTTP ${res.status} instead of 403 for request from unknown sender.`);
       }
