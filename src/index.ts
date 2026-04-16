@@ -21,6 +21,8 @@ const canonicalize = _canonicalize as unknown as (obj: unknown) => string | unde
 // ---------------------------------------------------------------------------
 
 interface AgentCard {
+  '@context'?: Record<string, string>;
+  '@type'?: string;
   arp: string;
   name: string;
   did: string;
@@ -32,6 +34,7 @@ interface AgentCard {
     description: string;
     schema: Record<string, unknown>;
     responseSchema: Record<string, unknown>;
+    open?: boolean;
   }>;
   auth: {
     required: boolean;
@@ -45,6 +48,8 @@ interface AgentCard {
 }
 
 interface AgentIndex {
+  '@context'?: Record<string, string>;
+  '@type'?: string;
   domain: string;
   protocol: string;
   agents: Array<{
@@ -95,18 +100,47 @@ interface CheckResult {
 }
 
 // ---------------------------------------------------------------------------
-// Crypto helpers (same approach as arp-server-ts)
+// Crypto helpers
 // ---------------------------------------------------------------------------
 
 const ED25519_SPKI_HEADER = Buffer.from('302a300506032b6570032100', 'hex');
+const ED25519_PKCS8_HEADER = Buffer.from('302e020100300506032b657004220420', 'hex');
+const ED25519_MULTICODEC_PREFIX = Buffer.from([0xed, 0x01]);
+
+// ---------------------------------------------------------------------------
+// Verifier test identity
+//
+// arp-verify ships with a fixed did:web test identity. The private key below
+// is INTENTIONALLY PUBLIC — this is a conformance tool, not a trusted agent.
+// Signatures from did:web:agentrelationsprotocol.com:arp-verify prove only
+// that a message was sent via arp-verify (or a tool using the same keys).
+// Receivers MUST treat this identity as any other unknown sender — via the
+// first-contact handshake — and MUST NOT grant privileges based on this DID.
+//
+// Spec Section 4.5 mandates did:web for all agent identities. A conformance
+// CLI cannot host per-run ephemeral DID docs, so the test identity is pinned.
+// ---------------------------------------------------------------------------
+
+const VERIFIER_DID = 'did:web:agentrelationsprotocol.com:arp-verify';
+const VERIFIER_PUBLIC_KEY_MULTIBASE = 'z6MkiFuoGib9ZwcE3fpVBNXqfMR4R3uKpPbr5Kx9YgWLikD7';
+const VERIFIER_PRIVATE_SEED_B64 = 'fM/RlM4qHVQMqs9jEIA6dnVz70yZGJVG51rfSnuSGls=';
 
 function rawPublicKey(publicKey: crypto.KeyObject): Buffer {
   const spki = publicKey.export({ type: 'spki', format: 'der' }) as Buffer;
   return spki.subarray(spki.length - 32);
 }
 
-function encodeMultibase(raw: Buffer): string {
-  return 'z' + bs58.encode(raw);
+/** Encode an Ed25519 public key as multibase with 0xed01 multicodec prefix (spec §4.3.1). */
+function encodeKeyMultibase(raw32: Buffer): string {
+  if (raw32.length !== 32) {
+    throw new Error(`Ed25519 public key must be 32 bytes, got ${raw32.length}`);
+  }
+  return 'z' + bs58.encode(Buffer.concat([ED25519_MULTICODEC_PREFIX, raw32]));
+}
+
+/** Encode a signature as multibase (no multicodec prefix, spec §4.3.1). */
+function encodeSignatureMultibase(sig: Buffer): string {
+  return 'z' + bs58.encode(sig);
 }
 
 function decodeMultibase(mb: string): Buffer {
@@ -117,9 +151,13 @@ function decodeMultibase(mb: string): Buffer {
 }
 
 function importPublicKey(keyOrMultibase: string | Buffer): crypto.KeyObject {
-  const raw = typeof keyOrMultibase === 'string'
+  let raw = typeof keyOrMultibase === 'string'
     ? decodeMultibase(keyOrMultibase)
     : keyOrMultibase;
+  // Strip multicodec Ed25519 prefix (0xed01) if present
+  if (raw.length === 34 && raw[0] === 0xed && raw[1] === 0x01) {
+    raw = raw.subarray(2);
+  }
   if (raw.length !== 32) {
     throw new Error(`Expected 32-byte Ed25519 public key, got ${raw.length} bytes`);
   }
@@ -130,11 +168,33 @@ function importPublicKey(keyOrMultibase: string | Buffer): crypto.KeyObject {
   });
 }
 
-function generateKeyPair(): { privateKey: crypto.KeyObject; publicKeyMultibase: string; did: string } {
-  const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
-  const pubMultibase = encodeMultibase(rawPublicKey(publicKey));
-  const did = `did:key:${pubMultibase}`;
-  return { privateKey, publicKeyMultibase: pubMultibase, did };
+/** Build an Ed25519 private KeyObject from a 32-byte seed. */
+function importPrivateSeed(seed32: Buffer): crypto.KeyObject {
+  if (seed32.length !== 32) {
+    throw new Error(`Ed25519 seed must be 32 bytes, got ${seed32.length}`);
+  }
+  return crypto.createPrivateKey({
+    key: Buffer.concat([ED25519_PKCS8_HEADER, seed32]),
+    format: 'der',
+    type: 'pkcs8',
+  });
+}
+
+interface VerifierIdentity {
+  privateKey: crypto.KeyObject;
+  publicKeyMultibase: string;
+  did: string;
+}
+
+/** Load the bundled did:web verifier identity. */
+function loadVerifierIdentity(): VerifierIdentity {
+  const seed = Buffer.from(VERIFIER_PRIVATE_SEED_B64, 'base64');
+  const privateKey = importPrivateSeed(seed);
+  return {
+    privateKey,
+    publicKeyMultibase: VERIFIER_PUBLIC_KEY_MULTIBASE,
+    did: VERIFIER_DID,
+  };
 }
 
 function signMessage(message: ARPMessage, privateKey: crypto.KeyObject): ARPMessage {
@@ -145,7 +205,7 @@ function signMessage(message: ARPMessage, privateKey: crypto.KeyObject): ARPMess
   }
   const payload = Buffer.from(canonical, 'utf-8');
   const sig = crypto.sign(null, payload, privateKey);
-  message.signature = encodeMultibase(sig);
+  message.signature = encodeSignatureMultibase(sig);
   return message;
 }
 
@@ -217,6 +277,30 @@ function baseUrl(domain: string): string {
   return `${scheme}://${domain}`;
 }
 
+/**
+ * Resolve a did:web identifier to its DID document URL per the did:web spec.
+ *
+ *   did:web:example.com            → https://example.com/.well-known/did.json
+ *   did:web:example.com:agent      → https://example.com/agent/did.json
+ *   did:web:host:a:b:c             → https://host/a/b/c/did.json
+ *   did:web:localhost%3A3141:agent → http://localhost:3141/agent/did.json
+ */
+function resolveDidWebUrl(did: string): string {
+  if (!did.startsWith('did:web:')) {
+    throw new Error(`Not a did:web identifier: ${did}`);
+  }
+  const parts = did.slice('did:web:'.length).split(':').map(p => decodeURIComponent(p));
+  const [host, ...path] = parts;
+  if (!host) {
+    throw new Error(`Invalid did:web (no host): ${did}`);
+  }
+  const scheme = isLocalhost(host) ? 'http' : 'https';
+  if (path.length === 0) {
+    return `${scheme}://${host}/.well-known/did.json`;
+  }
+  return `${scheme}://${host}/${path.join('/')}/did.json`;
+}
+
 // ---------------------------------------------------------------------------
 // HTTP helper with timeout
 // ---------------------------------------------------------------------------
@@ -277,22 +361,31 @@ async function run() {
   let agentName: string | undefined;
   let serverPublicKey: crypto.KeyObject | undefined;
 
+  // Bundled did:web test identity — see constants at top of file.
+  // All signed tests use this single identity. See README for semantics
+  // and the known limitation about first-contact-enforcement on repeat runs.
+  const verifier = loadVerifierIdentity();
+
   // 1. agents.txt
   try {
     const url = `${base}/agents.txt`;
     const res = await fetchJSON(url);
     const text = typeof res.body === 'string' ? res.body : JSON.stringify(res.body);
     if (!res.ok) {
-      fail('agents.txt', `HTTP ${res.status} from ${url}. Ensure your server exposes GET /agents.txt returning a text file with an "arp-index:" line.`);
-    } else if (!text.includes('arp-index:')) {
-      fail('agents.txt', `File found but missing "arp-index:" directive. The agents.txt file must contain a line like: arp-index: ${base}/.well-known/arp/index.json`);
-    } else {
-      pass('agents.txt', 'agents.txt found');
-      if (!text.includes('arp-version:')) {
-        warn('agents.txt', 'Missing "arp-version:" field. Recommended: arp-version: 1.0');
+      fail('agents.txt', `HTTP ${res.status} from ${url}. Ensure your server exposes GET /agents.txt returning a text file with an "arp-directory:" line.`);
+    } else if (!text.includes('arp-directory:')) {
+      if (text.includes('arp-index:')) {
+        fail('agents.txt', 'File uses deprecated "arp-index:" field. Rename to "arp-directory:" per v0.4.0 spec.');
+      } else {
+        fail('agents.txt', `File found but missing "arp-directory:" directive. The agents.txt file must contain a line like: arp-directory: ${base}/.well-known/arp/index.json`);
       }
-      if (!text.includes('arp-docs:')) {
-        warn('agents.txt', 'Missing "arp-docs:" field. Recommended: link to protocol documentation for AI agent discovery.');
+    } else {
+      pass('agents.txt', 'agents.txt found with arp-directory');
+      if (!text.includes('arp-version:')) {
+        warn('agents.txt', 'Missing "arp-version:" field (RECOMMENDED)');
+      }
+      if (!text.includes('open-capabilities:')) {
+        warn('agents.txt', 'Missing "open-capabilities:" field. List capabilities that accept stateless queries.');
       }
     }
   } catch (err) {
@@ -337,11 +430,14 @@ async function run() {
   }
 
   // 3. Agent Card
+  // Prefer the URL advertised in the directory manifest (supports subdomain-per-agent layouts);
+  // fall back to the conventional /.well-known/arp/<name>.json under the base domain.
+  const indexEntry = agentIndex?.agents.find(a => a.name === agentName);
+  const cardUrl = indexEntry?.url ?? `${base}/.well-known/arp/${agentName}.json`;
   try {
-    const url = `${base}/.well-known/arp/${agentName}.json`;
-    const res = await fetchJSON(url);
+    const res = await fetchJSON(cardUrl);
     if (!res.ok) {
-      fail('Agent Card', `HTTP ${res.status} from ${url}. Ensure your server exposes the agent card at /.well-known/arp/${agentName}.json`);
+      fail('Agent Card', `HTTP ${res.status} from ${cardUrl}. Ensure the card URL advertised in the directory index (or /.well-known/arp/${agentName}.json under ${base}) returns a valid Agent Card.`);
     } else {
       const data = res.body as Record<string, unknown>;
       const required = ['arp', 'name', 'did', 'inbox', 'publicKey', 'description', 'capabilities', 'auth'];
@@ -358,11 +454,31 @@ async function run() {
   }
 
   // 4. DID Document
+  // Resolve the DID URL from the agent card's `did` field using did:web rules.
+  // This correctly handles both single-host and subdomain-per-agent deployments.
+  let didUrl: string | undefined;
+  if (agentCard?.did) {
+    if (agentCard.did.startsWith('did:web:')) {
+      try {
+        didUrl = resolveDidWebUrl(agentCard.did);
+      } catch (err) {
+        fail('DID Document', `Could not parse agent DID "${agentCard.did}": ${(err as Error).message}`);
+      }
+    } else {
+      fail('DID Document', `Agent Card declares non-did:web identifier "${agentCard.did}" — spec §4.5 mandates did:web for all agent identities.`);
+    }
+  } else {
+    // No card fetched — try a legacy single-host fallback so we at least produce a clear error.
+    didUrl = `${base}/${agentName}/did.json`;
+  }
   try {
-    const url = `${base}/${agentName}/did.json`;
-    const res = await fetchJSON(url);
+    if (!didUrl) {
+      // A DID-parse failure already recorded above — skip the fetch.
+      throw new Error('__skip__');
+    }
+    const res = await fetchJSON(didUrl);
     if (!res.ok) {
-      fail('DID Document', `HTTP ${res.status} from ${url}. Ensure your server exposes GET /${agentName}/did.json returning the DID document.`);
+      fail('DID Document', `HTTP ${res.status} from ${didUrl}. Ensure the DID document is served at the path derived from the agent's did:web identifier (${agentCard?.did ?? 'unknown'}).`);
     } else {
       const data = res.body as Record<string, unknown>;
       const required = ['@context', 'id', 'verificationMethod', 'authentication', 'service'];
@@ -375,7 +491,10 @@ async function run() {
       }
     }
   } catch (err) {
-    fail('DID Document', `Could not fetch DID document — ${(err as Error).message}`);
+    const msg = (err as Error).message;
+    if (msg !== '__skip__') {
+      fail('DID Document', `Could not fetch DID document — ${msg}`);
+    }
   }
 
   // 5. Key Consistency
@@ -414,7 +533,7 @@ async function run() {
       arp: '1.0',
       id: newMessageId(),
       type: 'request',
-      from: 'did:key:test-unsigned',
+      from: 'did:web:arp-verify.invalid:unsigned-test',
       to: agentCard?.did ?? `did:web:${domain}:${agentName}`,
       createdAt: nowISO(),
       body: { test: true },
@@ -443,7 +562,7 @@ async function run() {
   }
 
   // 7. Signature Verification / Negotiate (first-contact)
-  const clientKeys = generateKeyPair();
+  const clientKeys = verifier;
   const agentDid = agentCard?.did ?? `did:web:${domain}:${agentName}`;
 
   let negotiateOk = false;
@@ -542,7 +661,7 @@ async function run() {
     if (!responseToCheck) {
       // Use a fresh negotiate to get a signed response
       try {
-        const checkKeys = generateKeyPair();
+        const checkKeys = verifier;
         const msg: ARPMessage = {
           arp: '1.0',
           id: newMessageId(),
@@ -584,40 +703,115 @@ async function run() {
     }
   }
 
-  // 10. First-Contact Enforcement
-  try {
-    const newKeys = generateKeyPair();
-    const reqMsg: ARPMessage = {
-      arp: '1.0',
-      id: newMessageId(),
-      type: 'request',
-      from: newKeys.did,
-      to: agentDid,
-      capability: 'echo',
-      createdAt: nowISO(),
-      body: { test: 'first-contact-enforcement' },
-    };
-    signMessage(reqMsg, newKeys.privateKey);
+  // 10. Open Capability (v0.4.0) — request without negotiate should work on open capabilities
+  const openCap = agentCard?.capabilities?.find(c => c.open === true);
 
-    const res = await fetchJSON(inboxUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/arp+json' },
-      body: JSON.stringify(reqMsg),
-    });
+  if (!openCap) {
+    warn('Open Capability', 'No open capabilities declared — skipped');
+  } else {
+    try {
+      const openKeys = verifier;
+      const openMsg: ARPMessage = {
+        arp: '1.0',
+        id: newMessageId(),
+        type: 'request',
+        from: openKeys.did,
+        to: agentDid,
+        capability: openCap.name,
+        createdAt: nowISO(),
+        body: { test: 'open-capability', publicKey: openKeys.publicKeyMultibase },
+      };
+      signMessage(openMsg, openKeys.privateKey);
 
-    if (res.status === 403) {
-      const body = res.body as ARPMessage;
-      const innerBody = body?.body as Record<string, unknown> | undefined;
-      if (innerBody?.code === 'FIRST_CONTACT_REQUIRED') {
+      const res = await fetchJSON(inboxUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/arp+json' },
+        body: JSON.stringify(openMsg),
+      });
+
+      if (res.status === 200) {
+        const body = res.body as ARPMessage;
+        if (body.type === 'response') {
+          pass('Open Capability', `Open capability "${openCap.name}" accepts requests without negotiate`);
+        } else {
+          fail('Open Capability', `Server returned 200 but type="${body.type}" instead of "response".`);
+        }
+      } else {
+        fail('Open Capability', `Server returned HTTP ${res.status} for open capability request without negotiate. Open capabilities should accept authenticated requests without prior handshake.`);
+      }
+    } catch (err) {
+      fail('Open Capability', `Request failed — ${(err as Error).message}`);
+    }
+  }
+
+  // 11. First-Contact Enforcement on non-open capability
+  const nonOpenCap = agentCard?.capabilities?.find(c => !c.open);
+
+  if (nonOpenCap) {
+    try {
+      const newKeys = verifier;
+      const reqMsg: ARPMessage = {
+        arp: '1.0',
+        id: newMessageId(),
+        type: 'request',
+        from: newKeys.did,
+        to: agentDid,
+        capability: nonOpenCap.name,
+        createdAt: nowISO(),
+        body: { test: 'first-contact-enforcement' },
+      };
+      signMessage(reqMsg, newKeys.privateKey);
+
+      const res = await fetchJSON(inboxUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/arp+json' },
+        body: JSON.stringify(reqMsg),
+      });
+
+      if (res.status === 403) {
+        const body = res.body as ARPMessage;
+        const innerBody = body?.body as Record<string, unknown> | undefined;
+        if (innerBody?.code === 'FIRST_CONTACT_REQUIRED') {
+          pass('First-Contact Enforcement', `Non-open capability "${nonOpenCap.name}" requires first contact`);
+        } else {
+          pass('First-Contact Enforcement', `First-contact enforcement working (403, code: ${innerBody?.code ?? 'unknown'})`);
+        }
+      } else {
+        fail('First-Contact Enforcement', `Server returned HTTP ${res.status} instead of 403 for non-open capability from unknown sender.`);
+      }
+    } catch (err) {
+      fail('First-Contact Enforcement', `Request failed — ${(err as Error).message}`);
+    }
+  } else {
+    // Fallback: test with a made-up capability name
+    try {
+      const newKeys = verifier;
+      const reqMsg: ARPMessage = {
+        arp: '1.0',
+        id: newMessageId(),
+        type: 'request',
+        from: newKeys.did,
+        to: agentDid,
+        capability: '__nonexistent__',
+        createdAt: nowISO(),
+        body: { test: 'first-contact-enforcement' },
+      };
+      signMessage(reqMsg, newKeys.privateKey);
+
+      const res = await fetchJSON(inboxUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/arp+json' },
+        body: JSON.stringify(reqMsg),
+      });
+
+      if (res.status === 403) {
         pass('First-Contact Enforcement', 'First-contact enforcement working');
       } else {
-        pass('First-Contact Enforcement', `First-contact enforcement working (403 returned, code: ${innerBody?.code ?? 'unknown'})`);
+        fail('First-Contact Enforcement', `Server returned HTTP ${res.status} instead of 403 for request from unknown sender.`);
       }
-    } else {
-      fail('First-Contact Enforcement', `Server returned HTTP ${res.status} instead of 403 for a request from an unknown sender. Requests from senders who have not completed negotiate should return FIRST_CONTACT_REQUIRED (HTTP 403).`);
+    } catch (err) {
+      fail('First-Contact Enforcement', `Request failed — ${(err as Error).message}`);
     }
-  } catch (err) {
-    fail('First-Contact Enforcement', `Request failed — ${(err as Error).message}`);
   }
 
   // 11. Expired Message Rejection
@@ -661,7 +855,45 @@ async function run() {
     }
   }
 
-  // 12. Content-Type Check
+  // 12. Relation in Negotiate Response (v0.4.0)
+  if (negotiateOk && echoResponse) {
+    const echoBody = echoResponse.body as Record<string, unknown>;
+    if (typeof echoBody.trustLevel === 'string') {
+      pass('Trust Annotations', `Server returns trust level: "${echoBody.trustLevel}"`);
+    } else {
+      warn('Trust Annotations', 'Server does not include trustLevel in responses (RECOMMENDED in v0.4.0)');
+    }
+  }
+
+  // 13. JSON-LD Agent Card (v0.4.0)
+  if (agentCard) {
+    const ctx = agentCard['@context'];
+    const type = agentCard['@type'];
+    if (ctx && type === 'SoftwareApplication') {
+      pass('JSON-LD Agent Card', 'Agent Card has @context and @type: SoftwareApplication');
+    } else if (ctx && !type) {
+      warn('JSON-LD Agent Card', 'Agent Card has @context but missing @type: SoftwareApplication');
+    } else if (!ctx && !type) {
+      warn('JSON-LD Agent Card', 'Agent Card missing JSON-LD fields (@context, @type). SHOULD include for search engine indexing.');
+    } else {
+      warn('JSON-LD Agent Card', `Unexpected JSON-LD: @type="${type}"`);
+    }
+  }
+
+  // 14. JSON-LD Agent Directory (v0.4.0)
+  if (agentIndex) {
+    const ctx = (agentIndex as unknown as Record<string, unknown>)['@context'];
+    const type = (agentIndex as unknown as Record<string, unknown>)['@type'];
+    if (ctx && type === 'CollectionPage') {
+      pass('JSON-LD Directory', 'Directory manifest has @context and @type: CollectionPage');
+    } else if (!ctx && !type) {
+      warn('JSON-LD Directory', 'Directory manifest missing JSON-LD fields. SHOULD include for crawler indexing.');
+    } else {
+      warn('JSON-LD Directory', `Unexpected JSON-LD: @type="${type}"`);
+    }
+  }
+
+  // 15. Content-Type Check
   try {
     const res = await fetchJSON(inboxUrl, {
       method: 'POST',
