@@ -45,6 +45,21 @@ interface AgentCard {
   };
   rateLimit?: { requests: number; window: string };
   contact?: string;
+  // v0.7 — Notifications (Section 21.6)
+  notifications?: {
+    supported: boolean;
+    events?: Record<string, string>;
+    defaultLease?: number;
+    maxLease?: number;
+  };
+  // v0.7 — Settlements (Section 22.3)
+  settlements?: {
+    supported: boolean;
+    rails: Array<{ name: string; spec: string; currencies: string[] }>;
+    primitives: Array<'prepay' | 'postpay'>;
+    settlementWindow?: string;
+    quoteCapability?: string;
+  };
 }
 
 interface AgentIndex {
@@ -85,6 +100,8 @@ interface ARPMessage {
   from: string;
   to: string;
   capability?: string;
+  event?: string; // v0.7 — present on `notify` messages
+  notificationId?: string; // v0.7 — present on `notify` messages
   correlationId?: string;
   createdAt: string;
   expiresAt?: string;
@@ -935,6 +952,82 @@ async function run() {
     }
   } catch (err) {
     fail('Content-Type Enforcement', `Request failed — ${(err as Error).message}`);
+  }
+
+  // 16. Notifications declaration (v0.7, Section 21.6)
+  if (agentCard) {
+    const notif = agentCard.notifications;
+    if (notif && typeof notif === 'object') {
+      if (notif.supported === true) {
+        const eventCount = notif.events ? Object.keys(notif.events).length : 0;
+        pass('Notifications Declaration', `Agent Card declares notifications with ${eventCount} event type(s)`);
+      } else {
+        warn('Notifications Declaration', 'notifications block present but `supported` is not true');
+      }
+    } else {
+      warn('Notifications Declaration', 'No notifications declaration. Optional in v0.7 (Section 21.6).');
+    }
+  }
+
+  // 17. Settlements declaration (v0.7, Section 22.3)
+  if (agentCard) {
+    const settle = agentCard.settlements;
+    if (settle && typeof settle === 'object') {
+      const railsValid = Array.isArray(settle.rails) && settle.rails.length > 0;
+      const primsValid = Array.isArray(settle.primitives) && settle.primitives.length > 0;
+      if (settle.supported === true && railsValid && primsValid) {
+        pass('Settlements Declaration', `Agent Card declares settlements with ${settle.rails.length} rail(s) and primitives [${settle.primitives.join(', ')}]`);
+      } else {
+        warn('Settlements Declaration', 'settlements block present but missing required fields (supported, rails, primitives)');
+      }
+    } else {
+      warn('Settlements Declaration', 'No settlements declaration. Optional in v0.7 (Section 22.3).');
+    }
+  }
+
+  // 18. Notify Acceptance (v0.7, Section 21.2)
+  if (negotiateOk) {
+    try {
+      const notifyMsg: ARPMessage = {
+        arp: '1.0',
+        id: newMessageId(),
+        type: 'notify',
+        from: clientKeys.did,
+        to: agentDid,
+        event: 'arp-verify.ping',
+        notificationId: `notif_${newMessageId().slice(4)}`,
+        createdAt: nowISO(),
+        body: { ping: true, source: 'arp-verify' },
+      };
+      signMessage(notifyMsg, clientKeys.privateKey);
+
+      const res = await fetchJSON(inboxUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/arp+json' },
+        body: JSON.stringify(notifyMsg),
+      });
+
+      if (res.status === 202) {
+        pass('Notify Acceptance', 'Signed notify accepted with HTTP 202 (Section 21.2)');
+      } else if (res.status >= 400) {
+        const body = res.body as Record<string, unknown> | undefined;
+        const innerBody = body?.body as Record<string, unknown> | undefined;
+        const code = innerBody?.code as string | undefined;
+        if (code === 'NOTIFICATION_REJECTED') {
+          pass('Notify Acceptance', 'Server enforces notification permission gate (NOTIFICATION_REJECTED)');
+        } else if (code === 'SCHEMA_INVALID' && res.status === 400) {
+          fail('Notify Acceptance', `Server rejected notify as SCHEMA_INVALID. Check that the server accepts the v0.7 envelope: type="notify", event, notificationId. Inner message: ${(innerBody?.message as string) ?? '(none)'}`);
+        } else {
+          fail('Notify Acceptance', `Signed notify returned HTTP ${res.status} with code "${code ?? '(none)'}". Expected 202 or NOTIFICATION_REJECTED.`);
+        }
+      } else {
+        fail('Notify Acceptance', `Server returned HTTP ${res.status} for signed notify. Expected 202 Accepted (Section 21.2).`);
+      }
+    } catch (err) {
+      fail('Notify Acceptance', `Notify request failed — ${(err as Error).message}`);
+    }
+  } else {
+    fail('Notify Acceptance', 'Skipped — negotiate failed first.');
   }
 
   printResults();
