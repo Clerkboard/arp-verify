@@ -459,7 +459,11 @@ async function run() {
     const aHandle = a.name.split('@')[0];
     return aHandle === agentHandle;
   });
-  const cardUrl = indexEntry?.url ?? `${base}/.well-known/arp/${agentHandle}.json`;
+  // Directory entries may use relative URLs (the spec's Section 5.4 examples do) —
+  // resolve against the base URL.
+  const cardUrl = indexEntry?.url
+    ? new URL(indexEntry.url, `${base}/`).toString()
+    : `${base}/.well-known/arp/${agentHandle}.json`;
   try {
     const res = await fetchJSON(cardUrl);
     if (!res.ok) {
@@ -487,6 +491,14 @@ async function run() {
     if (agentCard.did.startsWith('did:web:')) {
       try {
         didUrl = resolveDidWebUrl(agentCard.did);
+        // Dev-mode fallback: a server on localhost:<port> often mints
+        // did:web:localhost:<agent> (port omitted — strictly it should be
+        // percent-encoded per did:web). Resolving that loses the port, so
+        // when verifying a localhost target, serve the DID doc from the
+        // actual base instead.
+        if (domain.startsWith('localhost') && new URL(didUrl).hostname === 'localhost' && new URL(didUrl).port !== new URL(base).port) {
+          didUrl = `${base}/${agentHandle}/did.json`;
+        }
       } catch (err) {
         fail('DID Document', `Could not parse agent DID "${agentCard.did}": ${(err as Error).message}`);
       }
